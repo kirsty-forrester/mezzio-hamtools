@@ -6,6 +6,7 @@ namespace App\Service;
 
 use InvalidArgumentException;
 
+use function in_array;
 use function preg_match;
 use function sprintf;
 use function strlen;
@@ -15,7 +16,7 @@ use function trim;
 
 /**
  * Parses a callsign and resolves its DXCC entity, country and
- * (for UK calls) a guessed licence class.
+ * the licence class for UK callsigns
  */
 final class PrefixLookup
 {
@@ -26,17 +27,32 @@ final class PrefixLookup
     private const PATTERN = '/^([A-Z0-9]{1,3}?)(\d)([A-Z]{1,4})$/';
 
     /**
-     * Alpha prefix => [DXCC entity, country]. Longest key wins, so list the
-     * two-letter regional prefixes (2E, GM, GW...) before the single letters.
+     * UK national prefixes always start G, M or 2. The letter after
+     * that is the regional locator.
+     *
+     * @var array<string, string>
+     */
+    private const UK_LOCATORS = [
+        'E' => 'England',
+        'M' => 'Scotland',
+        'W' => 'Wales',
+        'I' => 'Northern Ireland',
+        'D' => 'Isle of Man',
+        'J' => 'Jersey',
+        'U' => 'Guernsey',
+    ];
+
+    /**
+     * Non-UK DXCC prefixes. Longest key wins; list two-letter prefixes first.
      *
      * @var array<string, array{0: string, 1: string}>
      */
     private const PREFIXES = [
-        '2E' => ['England', 'United Kingdom'],
-        'MM' => ['Scotland', 'United Kingdom'],
-        'M'  => ['England', 'United Kingdom'],
-        'G'  => ['England', 'United Kingdom'],
-        // Next: add Guernsey etc and USA (W, K, N, A) and Australia (VK).
+        'VK' => ['Australia', 'Australia'],
+        'W'  => ['United States', 'USA'],
+        'K'  => ['United States', 'USA'],
+        'N'  => ['United States', 'USA'],
+        'A'  => ['United States', 'USA'],
     ];
 
     public function lookup(string $call): Callsign
@@ -52,11 +68,15 @@ final class PrefixLookup
         [, $letters, $digit, $suffix] = $matches;
         $prefix = $letters . $digit;
 
-        [$entity, $country] = $this->resolveEntity($letters);
+        $uk = $this->resolveUk($letters, $digit);
 
-        $licenceClass = $country === 'United Kingdom'
-            ? $this->guessUkLicenceClass($letters, $digit)
-            : null;
+        if ($uk !== null) {
+            [$entity, $licenceClass] = $uk;
+            $country                 = 'United Kingdom';
+        } else {
+            [$entity, $country] = $this->resolveEntity($letters);
+            $licenceClass       = null;
+        }
 
         return new Callsign(
             callsign: $call,
@@ -69,7 +89,79 @@ final class PrefixLookup
     }
 
     /**
-     * Match the longest alpha prefix we know about (try 2 chars, then 1).
+     * Structural check only — is this shaped like a callsign at all? This is
+     * the single source of truth for "valid callsign", reused by the validation
+     * middleware so the gatekeeper and the parser can never drift apart.
+     */
+    public function isValid(string $call): bool
+    {
+        return preg_match(self::PATTERN, strtoupper(trim($call))) === 1;
+    }
+
+    /**
+     * Recognise a UK call and resolve its home nation + licence class.
+     *
+     * @return array{0: string, 1: ?string}|null [entity, licenceClass], or null
+     *                                            if this isn't a UK callsign.
+     */
+    private function resolveUk(string $letters, string $digit): ?array
+    {
+        $national = $letters[0];          // G, M or 2
+        $locator  = substr($letters, 1);  // '', or one of E M W I D J U
+
+        if (! in_array($national, ['G', 'M', '2'], true)) {
+            return null;
+        }
+
+        $entity = $this->ukEntity($national, $locator);
+        if ($entity === null) {
+            return null; // e.g. "2A" or "MX" — not a real UK locator
+        }
+
+        return [$entity, $this->ukLicenceClass($national, $digit)];
+    }
+
+    /**
+     * The 2-series always carries a locator letter (England is 2E, and the
+     * locator is required). The G/M series omit the letter for England, though
+     * since 2024 an optional 'E' locator may be used there too (uncommon).
+     */
+    private function ukEntity(string $national, string $locator): ?string
+    {
+        if ($national === '2') {
+            return self::UK_LOCATORS[$locator] ?? null;
+        }
+
+        if ($locator === '') {
+            return 'England';
+        }
+
+        return self::UK_LOCATORS[$locator] ?? null;
+    }
+
+    /**
+     * Licence class is decided by the national letter + the separating digit;
+     * the regional locator has no bearing on it.
+     */
+    private function ukLicenceClass(string $national, string $digit): ?string
+    {
+        return match ($national) {
+            'G'     => in_array($digit, ['0', '1', '2', '3', '4', '5', '6', '7', '8'], true)
+                ? 'Full'
+                : null,
+            '2'     => in_array($digit, ['0', '1'], true) ? 'Intermediate' : null,
+            'M'     => match ($digit) {
+                '3', '6', '7' => 'Foundation',
+                '8', '9'      => 'Intermediate',
+                '0', '1', '5' => 'Full',
+                default       => null,
+            },
+            default => null,
+        };
+    }
+
+    /**
+     * Match the longest non-UK prefix we know about (try 2 chars, then 1).
      *
      * @return array{0: string, 1: string} [entity, country]
      */
@@ -83,25 +175,5 @@ final class PrefixLookup
         }
 
         return ['Unknown', 'Unknown'];
-    }
-
-    /**
-     * UK licence class guessed from the prefix. Cross-check against Ofcom/QRZ.
-     * 
-     * TODO: Finish this. This is just an initial attempt and need to check
-     * the prefixes more closely. I am missing the newer intermediate prefixes
-     * for sure
-     */
-    private function guessUkLicenceClass(string $letters, string $digit): ?string
-    {
-        // 2x = Intermediate; any G-call = Full; M-series decided by the digit.
-        return match (true) {
-            str_starts_with($letters, '2')          => 'Intermediate',
-            str_starts_with($letters, 'G')          => 'Full',
-            ! str_starts_with($letters, 'M')        => null,
-            in_array($digit, ['0', '1', '5'], true) => 'Full',
-            in_array($digit, ['3', '6', '7'], true) => 'Foundation',
-            default                                 => null,
-        };
     }
 }
